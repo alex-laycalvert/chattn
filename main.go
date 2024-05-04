@@ -1,93 +1,94 @@
 package main
 
 import (
-	"embed"
+	"errors"
 	"fmt"
-	"io/fs"
-	"net/http"
 	"os"
+	"strconv"
 
-	"github.com/alex-laycalvert/chattn/internal"
-	"github.com/gorilla/csrf"
-	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
-	"github.com/unrolled/render"
-
-	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
-
-	_ "embed"
+	"github.com/alex-laycalvert/chattn/internal/client"
+	"github.com/alex-laycalvert/chattn/internal/server"
 )
 
-//go:embed assets/*
-var embeddedAssetsFS embed.FS
+const (
+	MODE_SERVER  = iota
+	MODE_CLIENT  = iota
+	DEFAULT_PORT = 8889
+	SERVER_FLAG  = "--server"
+)
 
-//go:embed templates/*
-var templatesFS embed.FS
-
-func assetFS() fs.FS {
-	if internal.EnvVars.DevMode {
-		return os.DirFS("assets")
-	}
-
-	sub, err := fs.Sub(embeddedAssetsFS, "assets")
-	if err != nil {
-		panic(fmt.Errorf("failed to get sub FS: %w", err))
-	}
-
-	return sub
+type Config struct {
+	// Either MODE_SERVER or MODE_CLIENT
+	mode uint8
+	// Host to connect to if in MODE_CLIENT
+	host string
+	// Port to use for either MODE_SERVER or MODE_CLIENT
+	port int
 }
 
 func main() {
-	internal.LoadEnv()
-
-	configLogger()
-
-	c := chi.NewRouter()
-	c.Use(middleware.Logger)
-	c.Use(middleware.Recoverer)
-	c.Use(middleware.Compress(5))
-
-	renderer := internal.Renderer{}
-	if !internal.EnvVars.DevMode {
-		renderer.FileSystem = &render.EmbedFileSystem{FS: templatesFS}
+	args := os.Args
+	config, err := parseArgs(args)
+	if err != nil {
+		usage()
+		fmt.Printf("\nerror: %s\n", err.Error())
+		os.Exit(1)
 	}
-
-	// todo: this assets delivery works but has indexes, best to not list dir contents
-	c.Handle("/assets/*", http.StripPrefix("/assets/", http.FileServer(http.FS(assetFS()))))
-
-	c.Get("/", func(w http.ResponseWriter, r *http.Request) {
-		renderer.RenderHTML(r, w, "index", nil)
-	})
-	c.Get("/status", func(w http.ResponseWriter, r *http.Request) {
-		renderer.RenderHTML(r, w, "status", nil)
-	})
-	c.Get("/technologies", func(w http.ResponseWriter, r *http.Request) {
-		renderer.RenderHTML(r, w, "technologies", nil)
-	})
-	c.Get("/csrf-testing", func(w http.ResponseWriter, r *http.Request) {
-		renderer.RenderHTML(r, w, "csrf-testing", nil)
-	})
-	c.Post("/csrf-testing", func(w http.ResponseWriter, r *http.Request) {
-		renderer.RenderHTML(r, w, "csrf-testing-post", r.PostForm)
-	})
-
-	log.Info().Str("listenAddr", internal.EnvVars.ListenAddr).Msg("starting server")
-	if err := http.ListenAndServe(internal.EnvVars.ListenAddr, csrf.Protect(internal.EnvVars.CSRFKey)(c)); err != nil {
-		panic(fmt.Errorf("failed to listen and serve: %w", err))
+	if config.mode == MODE_SERVER {
+		server := server.New(config.port)
+		if err := server.Start(); err != nil {
+			fmt.Printf("error: %s", err.Error())
+			os.Exit(1)
+		}
+	} else if config.mode == MODE_CLIENT {
+		client := client.New(config.host, config.port)
+		if err := client.Connect(); err != nil {
+			fmt.Printf("error: %s", err.Error())
+			os.Exit(1)
+		}
+	} else {
+		fmt.Printf("error: invalid mode, must be either MODE_SERVER or MODE_CLIENT")
+		os.Exit(1)
 	}
 }
 
-func configLogger() {
-	if internal.EnvVars.DevMode {
-		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
-		log.Info().Msg("dev mode enabled")
+func parseArgs(args []string) (Config, error) {
+	config := Config{mode: MODE_CLIENT, port: 8889}
+	length := len(args)
+	if length < 2 {
+		return config, errors.New("not enough arguments")
 	}
+	if length > 3 {
+		return config, errors.New("too many arguments")
+	}
+	if args[1] == SERVER_FLAG {
+		config.mode = MODE_SERVER
+	} else {
+		config.host = args[1]
+	}
+	if length > 2 {
+		port, err := strconv.Atoi(args[2])
+		if err != nil {
+			return config, errors.New("failed to parse port - " + err.Error())
+		}
+		if port < 0 {
+			return config, errors.New(fmt.Sprintf("invalid port %d, cannot be less than or equal to 0", port))
+		}
+		if port > 65535 {
+			return config, errors.New(fmt.Sprintf("invalid port %d, cannot be greater than 65535", port))
+		}
+		config.port = port
+	}
+	return config, nil
+}
 
-	// set chi middleware logger to zerolog
-	middleware.DefaultLogger = middleware.RequestLogger(
-		&middleware.DefaultLogFormatter{
-			Logger:  &log.Logger,
-			NoColor: !internal.EnvVars.DevMode,
-		})
+func usage() {
+	fmt.Println("usage:")
+	fmt.Println("\tchattn <host>[:<port>]")
+	fmt.Println("\tchattn --server [<port>]")
+	fmt.Println("")
+	fmt.Println("<host>\t\tthe chattn server to connect to (only in client mode)")
+	fmt.Println("<port>\t\tthe port to connect to chattn on (default 8889)")
+	fmt.Println("--server, -s\tif provided, will start a chattn server on the given")
+	fmt.Println("\t\tport (default 8889)")
 }
